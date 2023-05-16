@@ -1,11 +1,15 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/rpc"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -39,11 +43,27 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	keepFlag := true
+	for keepFlag {
+		task := GetTask()
+		switch task.taskType {
+		case MapTask:
+			{
+				doMapTask(mapf, &task)
+				callMarkFinished(&task)
+			}
+		case WaitingTask:
+			{
+				fmt.Println("All tasks are in progress, please wait...")
+				time.Sleep(time.Second)
+			}
+		case ExitTask:
+			{
+				fmt.Println("Task about :[", task.taskId, "] is terminated...")
+				keepFlag = false
+			}
+		}
+	}
 
 }
 
@@ -53,9 +73,26 @@ func Worker(mapf func(string, string) []KeyValue,
 // the RPC argument and reply types are defined in rpc.go.
 //
 
-func callAllocateFile() {
-	args := AllocateFileArgs{workerName: RandStringRunes(6)}
+// GetTask 获取任务（需要知道是Map任务，还是Reduce）
+func GetTask() Task {
 
+	args := TaskArgs{}
+	reply := Task{}
+	ok := call("Coordinator.PollTask", &args, &reply)
+
+	if ok {
+		fmt.Println(reply)
+	} else {
+		fmt.Printf("call failed!\n")
+	}
+	return reply
+}
+func callMarkFinished(task *Task) {
+	ok := call("Coordinator.MarkFinished", task, task)
+	if !ok {
+		fmt.Printf("call failed!\n")
+		fmt.Printf("更新任务状态失败")
+	}
 }
 
 func CallExample() {
@@ -101,4 +138,38 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+// 完成Map过程
+func doMapTask(mapf func(string, string) []KeyValue, task *Task) {
+	// 定义中间输出
+	intermediate := []KeyValue{}
+	file, err := os.Open(task.fileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", task.fileName)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", task.fileName)
+	}
+	values := mapf(task.fileName, string(content))
+	intermediate = append(intermediate, values...)
+	file.Close()
+	//initialize and loop over []KeyValue
+	rn := task.nReduce
+	// 创建一个长度为nReduce的二维切片
+	HashedKV := make([][]KeyValue, rn)
+
+	for _, kv := range intermediate {
+		HashedKV[ihash(kv.Key)%rn] = append(HashedKV[ihash(kv.Key)%rn], kv)
+	}
+	for i := 0; i < rn; i++ {
+		oname := "mr-tmp-" + strconv.Itoa(task.taskId) + "-" + strconv.Itoa(i)
+		ofile, _ := os.Create(oname)
+		enc := json.NewEncoder(ofile)
+		for _, kv := range HashedKV[i] {
+			enc.Encode(kv)
+		}
+		ofile.Close()
+	}
 }
