@@ -15,8 +15,8 @@ type Coordinator struct {
 	ReducerNum        int            // 传入的参数决定需要多少个reducer
 	TaskId            int            // 用于生成task的特殊id
 	DistPhase         Phase          // 目前整个框架应该处于什么任务阶段
-	TaskChannelReduce chan *Task     // 使用chan保证并发安全
-	TaskChannelMap    chan *Task     // 使用chan保证并发安全
+	TaskChannelReduce chan *Task     // reduce task 队列，使用chan保证并发安全
+	TaskChannelMap    chan *Task     // map task 队列，使用chan保证并发安全
 	TaskMetaHolder    TaskMetaHolder // 存着task
 	Files             []string       // 传入的文件数组
 }
@@ -45,7 +45,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-//发放任务
+// 发放任务
 func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 	lock.Lock()
 	defer lock.Unlock()
@@ -53,15 +53,19 @@ func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 	switch c.DistPhase {
 	case MapPhase:
 		{
+			//如果map任务队列中还有任务时
 			if len(c.TaskChannelMap) > 0 {
 				*reply = *<-c.TaskChannelMap
-				if !c.TaskMetaHolder.judgeState(reply.taskId) {
-					fmt.Printf("taskid[ %d ] is running\n", reply.taskId)
+				//判断拿到的任务是否是等待状态
+				if !c.TaskMetaHolder.judgeState(reply.TaskId) {
+					fmt.Printf("taskid[ %d ] is running\n", reply.TaskId)
 				}
 			} else {
-				reply.taskType = WaitingTask // 如果map任务被分发完了但是又没完成，此时就将任务设为Waitting，其实是没这样的任务的
+				reply.TaskType = WaitingTask // 如果map任务被分发完了但是又没完成，此时就将任务设为Waitting，其实是没这样的任务的
 				if c.TaskMetaHolder.checkTaskDone() {
 					c.toNextPhase()
+					//更换任务阶段时，重置任务Id
+					c.TaskId = 1
 				}
 				return nil
 			}
@@ -69,7 +73,7 @@ func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 		}
 	default:
 		{
-			reply.taskType = ExitTask
+			reply.TaskType = ExitTask
 		}
 	}
 	return nil
@@ -77,14 +81,14 @@ func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 func (c *Coordinator) MarkFinished(args *Task, reply *Task) error {
 	lock.Lock()
 	defer lock.Unlock()
-	switch args.taskType {
+	switch args.TaskType {
 	case MapTask:
-		meta, ok := c.TaskMetaHolder.MetaMap[args.taskId]
+		meta, ok := c.TaskMetaHolder.MetaMap[args.TaskId]
 		if ok && meta.state == Working {
 			meta.state = Done
-			fmt.Printf("Map task Id[%d] is finished.\n", args.taskId)
+			fmt.Printf("Map task Id[%d] is finished.\n", args.TaskId)
 		} else {
-			fmt.Printf("Map task Id[%d] is finished,already ! ! !\n", args.taskId)
+			fmt.Printf("Map task Id[%d] is finished,already ! ! !\n", args.TaskId)
 		}
 		break
 	default:
@@ -128,7 +132,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		ReducerNum:        nReduce,
 		TaskId:            1,
-		DistPhase:         MapPhase,
+		DistPhase:         MapPhase, //一开始初始化为map 阶段
 		TaskChannelReduce: make(chan *Task, nReduce),
 		TaskChannelMap:    make(chan *Task, len(files)),
 		Files:             files,
@@ -136,7 +140,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			MetaMap: make(map[int]*TaskMetaInfo, len(files)+nReduce),
 		},
 	}
-
+	//初始化map任务
+	c.makeMapTasks(files)
 	log.Println("成功创建Coordinator,并开启服务")
 	c.server()
 	return &c
@@ -146,10 +151,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 func (c *Coordinator) makeMapTasks(files []string) {
 	for _, v := range files {
 		task := Task{
-			taskId:   c.generateTaskId(),
-			taskType: MapTask,
-			nReduce:  c.ReducerNum,
-			fileName: v,
+			TaskId:   c.generateTaskId(),
+			TaskType: MapTask,
+			NReduce:  c.ReducerNum,
+			FileName: v,
 		}
 		//任务加入Map任务管道
 		c.TaskChannelMap <- &task
@@ -160,6 +165,19 @@ func (c *Coordinator) makeMapTasks(files []string) {
 	}
 }
 
+func (c *Coordinator) makeReduceTasks(nReduce int) {
+	for i := 1; i <= nReduce; i++ {
+		task := Task{
+			TaskId:   c.generateTaskId(),
+			TaskType: ReduceTask,
+		}
+		c.TaskChannelReduce <- &task
+		info := TaskMetaInfo{state: Waiting, TaskAddr: &task}
+		c.TaskMetaHolder.acceptMetaInfo(&info)
+		fmt.Println("make a reduce task", &task)
+	}
+}
+
 func (c *Coordinator) generateTaskId() int {
 	taskID := c.TaskId
 	c.TaskId++
@@ -167,7 +185,7 @@ func (c *Coordinator) generateTaskId() int {
 }
 
 func (t *TaskMetaHolder) acceptMetaInfo(info *TaskMetaInfo) bool {
-	taskId := info.TaskAddr.taskId
+	taskId := info.TaskAddr.TaskId
 	_, ok := t.MetaMap[taskId]
 	if ok {
 		fmt.Println("meta contains task which id = ", taskId)
@@ -178,7 +196,7 @@ func (t *TaskMetaHolder) acceptMetaInfo(info *TaskMetaInfo) bool {
 	return true
 }
 
-// 判断给定任务是否在工作，并修正其目前任务信息状态
+// 判断给定任务是否处于等待状态：如果是修改为运作中，返回true;否则返回false.
 func (t *TaskMetaHolder) judgeState(taskId int) bool {
 	info, ok := t.MetaMap[taskId]
 	if !ok || info.state != Waiting {
@@ -188,7 +206,7 @@ func (t *TaskMetaHolder) judgeState(taskId int) bool {
 	return true
 }
 
-// 检查多少个任务做了包括（map、reduce）,
+// 检查多少个任务做了包括（map、reduce）,判断任务是不是都完成了
 func (t *TaskMetaHolder) checkTaskDone() bool {
 	var (
 		mapDoneNum      = 0
@@ -198,13 +216,13 @@ func (t *TaskMetaHolder) checkTaskDone() bool {
 	)
 	// 遍历储存task信息的map
 	for _, v := range t.MetaMap {
-		if v.TaskAddr.taskType == MapTask {
+		if v.TaskAddr.TaskType == MapTask {
 			if v.state == Done {
 				mapDoneNum++
 			} else {
 				mapUnDoneNum++
 			}
-		} else if v.TaskAddr.taskType == ReduceTask {
+		} else if v.TaskAddr.TaskType == ReduceTask {
 			if v.state == Done {
 				reduceDoneNum++
 			} else {
@@ -213,16 +231,18 @@ func (t *TaskMetaHolder) checkTaskDone() bool {
 		}
 	}
 	if (mapDoneNum > 0 && mapUnDoneNum == 0) && (reduceDoneNum == 0 && reduceUnDoneNum == 0) {
+		//map 任务都完成了
 		return true
 	} else {
+		//reduce 任务都完成了
 		if reduceDoneNum > 0 && reduceUnDoneNum == 0 {
 			return true
 		}
 	}
-	return true
+	return false
 }
 
-//转换状态
+// 转换状态
 func (c *Coordinator) toNextPhase() {
 	if c.DistPhase == MapPhase {
 		c.DistPhase = ReducePhase

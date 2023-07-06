@@ -29,6 +29,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	//从编译好的插件中获取map-function & reduce-function，后续使用
 	mapf, reducef := loadPlugin(os.Args[1])
 
 	//
@@ -50,6 +51,7 @@ func main() {
 			log.Fatalf("cannot read %v", filename)
 		}
 		file.Close()
+		//执行map func ，将文件中的键值对存入intermediate
 		kva := mapf(filename, string(content))
 		intermediate = append(intermediate, kva...)
 	}
@@ -59,9 +61,10 @@ func main() {
 	// intermediate data is in one place, intermediate[],
 	// rather than being partitioned into NxM buckets.
 	//
-	// 对key value 进行排序
+	// 对key value 进行排序，利用原生sort切片的排序方法
 	sort.Sort(ByKey(intermediate))
 
+	// 定义文件名，创建文件
 	oname := "mr-out-0"
 	ofile, _ := os.Create(oname)
 
@@ -79,6 +82,7 @@ func main() {
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
+		//得到某个word 的count
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
@@ -90,10 +94,8 @@ func main() {
 	ofile.Close()
 }
 
-//
 // load the application Map and Reduce functions
 // from a plugin file, e.g. ../mrapps/wc.so
-//
 func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
 	p, err := plugin.Open(filename)
 	if err != nil {
