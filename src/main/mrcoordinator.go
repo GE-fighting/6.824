@@ -9,7 +9,10 @@ package main
 // Please do not change this file.
 //
 
-import "6.824/mr"
+import (
+	"6.824/mr"
+	"log"
+)
 import "time"
 import "os"
 import "fmt"
@@ -26,6 +29,6 @@ func main() {
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}
-
+	log.Printf("--------------------------------------协调者进程关闭------------------------------------")
 	time.Sleep(time.Second)
 }

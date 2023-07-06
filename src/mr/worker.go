@@ -6,31 +6,24 @@ import (
 	"hash/fnv"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
-
-var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-func RandStringRunes(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letterRunes[rand.Intn(len(letterRunes))]
-	}
-	return string(b)
-}
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -55,12 +48,18 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 		case WaitingTask:
 			{
-				fmt.Println("All tasks are in progress, please wait...")
+				fmt.Println("worker接受到了等待任务, please wait...")
 				time.Sleep(time.Second)
+			}
+		case ReduceTask:
+			{
+				fmt.Printf("start run reduce task- %d \n", task.TaskId)
+				doReduceTask(reducef, &task)
+				callMarkFinished(&task)
 			}
 		case ExitTask:
 			{
-				fmt.Println("Task about :[", task.TaskId, "] is terminated...")
+				fmt.Println("-------------------------------------------------work process exited--------------------------------------------------------------------------------")
 				keepFlag = false
 			}
 		}
@@ -148,7 +147,7 @@ func doMapTask(mapf func(string, string) []KeyValue, task *Task) {
 	// 定义中间输出
 	intermediate := []KeyValue{}
 	//打开w
-	file, err := os.Open(task.FileName)
+	file, err := os.Open(task.FileName[0])
 	if err != nil {
 		log.Fatalf("%v", err)
 		log.Fatalf("cannot open %v", task.FileName)
@@ -157,7 +156,7 @@ func doMapTask(mapf func(string, string) []KeyValue, task *Task) {
 	if err != nil {
 		log.Fatalf("cannot read %v", task.FileName)
 	}
-	values := mapf(task.FileName, string(content))
+	values := mapf(task.FileName[0], string(content))
 	intermediate = append(intermediate, values...)
 	file.Close()
 	//initialize and loop over []KeyValue
@@ -169,7 +168,7 @@ func doMapTask(mapf func(string, string) []KeyValue, task *Task) {
 		HashedKV[ihash(kv.Key)%rn] = append(HashedKV[ihash(kv.Key)%rn], kv)
 	}
 	for i := 0; i < rn; i++ {
-		oname := "mr-tmp-" + strconv.Itoa(task.TaskId) + "-" + strconv.Itoa(i)
+		oname := "mr-tmp-" + strconv.Itoa(task.TaskId) + "-" + strconv.Itoa(i+1)
 		ofile, _ := os.Create(oname)
 		enc := json.NewEncoder(ofile)
 		for _, kv := range HashedKV[i] {
@@ -177,4 +176,58 @@ func doMapTask(mapf func(string, string) []KeyValue, task *Task) {
 		}
 		ofile.Close()
 	}
+}
+
+// 完成一次 Reduce 任务
+func doReduceTask(reducef func(key string, values []string) string, task *Task) {
+	// 定义中间输出,从文件中读取出来
+	intermediate := []KeyValue{}
+	// 根据正则表达式进行文件名筛选
+	for _, fileName := range task.FileName {
+		file, err := os.Open(fileName)
+		if err != nil {
+			log.Printf("fail open file - %s \n", fileName)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+
+	}
+	sort.Sort(ByKey(intermediate))
+
+	//进行reduce操作
+	// 定义文件名，创建文件
+	oname := "mr-out-" + strconv.Itoa(task.TaskId)
+	ofile, _ := os.Create(oname)
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		//得到某个word 的count
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
 }

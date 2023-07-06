@@ -2,12 +2,16 @@ package mr
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 type Coordinator struct {
@@ -26,8 +30,9 @@ type TaskMetaHolder struct {
 }
 
 type TaskMetaInfo struct {
-	state    State
-	TaskAddr *Task
+	state     State
+	StartTime time.Time //任务开始时间，为crash做好准备
+	TaskAddr  *Task
 }
 
 var (
@@ -53,6 +58,7 @@ func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 	switch c.DistPhase {
 	case MapPhase:
 		{
+			log.Printf("-----------处于Map阶段------------------------")
 			//如果map任务队列中还有任务时
 			if len(c.TaskChannelMap) > 0 {
 				*reply = *<-c.TaskChannelMap
@@ -63,17 +69,39 @@ func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 			} else {
 				reply.TaskType = WaitingTask // 如果map任务被分发完了但是又没完成，此时就将任务设为Waitting，其实是没这样的任务的
 				if c.TaskMetaHolder.checkTaskDone() {
+					log.Printf("从map阶段转移至reduce阶段")
+					c.makeReduceTasks(c.ReducerNum)
 					c.toNextPhase()
-					//更换任务阶段时，重置任务Id
-					c.TaskId = 1
 				}
 				return nil
 			}
 
 		}
-	default:
+	case ReducePhase:
+		{
+			log.Printf("-----------处于reduce阶段------------------------")
+			//如果reduce 任务队列里面还有队列的话
+			if len(c.TaskChannelReduce) > 0 {
+				*reply = *<-c.TaskChannelReduce
+				//判断拿到的任务是否是等待状态
+				if !c.TaskMetaHolder.judgeState(reply.TaskId) {
+					fmt.Printf("taskid[ %d ] is running\n", reply.TaskId)
+				}
+			} else {
+				reply.TaskType = WaitingTask // 如果reduce任务被分发完了但是又没完成，此时就将任务设为Waitting，其实是没这样的任务的
+				if c.TaskMetaHolder.checkTaskDone() {
+					c.toNextPhase()
+				}
+				return nil
+			}
+		}
+	case ExitPhase:
 		{
 			reply.TaskType = ExitTask
+		}
+	default:
+		{
+			panic("The phase undefined ! ! !")
 		}
 	}
 	return nil
@@ -89,6 +117,15 @@ func (c *Coordinator) MarkFinished(args *Task, reply *Task) error {
 			fmt.Printf("Map task Id[%d] is finished.\n", args.TaskId)
 		} else {
 			fmt.Printf("Map task Id[%d] is finished,already ! ! !\n", args.TaskId)
+		}
+		break
+	case ReduceTask:
+		meta, ok := c.TaskMetaHolder.MetaMap[args.TaskId]
+		if ok && meta.state == Working {
+			meta.state = Done
+			fmt.Printf("Reduce task Id[%d] is finished.\n", args.TaskId)
+		} else {
+			fmt.Printf("Reduce task Id[%d] is finished,already ! ! !\n", args.TaskId)
 		}
 		break
 	default:
@@ -144,6 +181,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.makeMapTasks(files)
 	log.Println("成功创建Coordinator,并开启服务")
 	c.server()
+	go c.CrashDetector()
 	return &c
 }
 
@@ -154,7 +192,7 @@ func (c *Coordinator) makeMapTasks(files []string) {
 			TaskId:   c.generateTaskId(),
 			TaskType: MapTask,
 			NReduce:  c.ReducerNum,
-			FileName: v,
+			FileName: []string{v},
 		}
 		//任务加入Map任务管道
 		c.TaskChannelMap <- &task
@@ -164,12 +202,29 @@ func (c *Coordinator) makeMapTasks(files []string) {
 		fmt.Println("make a map task :", &task)
 	}
 }
+func (c *Coordinator) fileNameReduceTask(reduceNum int) []string {
+	s := []string{}
+	dir, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("fail open dir %v \n", err)
+	}
+	files, _ := ioutil.ReadDir(dir)
+	for _, fi := range files {
+
+		if strings.HasPrefix(fi.Name(), "mr-tmp") && strings.HasSuffix(fi.Name(), strconv.Itoa(reduceNum)) {
+			s = append(s, fi.Name())
+		}
+	}
+	return s
+}
 
 func (c *Coordinator) makeReduceTasks(nReduce int) {
 	for i := 1; i <= nReduce; i++ {
 		task := Task{
 			TaskId:   c.generateTaskId(),
 			TaskType: ReduceTask,
+			NReduce:  nReduce,
+			FileName: c.fileNameReduceTask(i),
 		}
 		c.TaskChannelReduce <- &task
 		info := TaskMetaInfo{state: Waiting, TaskAddr: &task}
@@ -202,7 +257,9 @@ func (t *TaskMetaHolder) judgeState(taskId int) bool {
 	if !ok || info.state != Waiting {
 		return false
 	}
+	//更新任务状态信息
 	t.MetaMap[taskId].state = Working
+	t.MetaMap[taskId].StartTime = time.Now()
 	return true
 }
 
@@ -248,5 +305,33 @@ func (c *Coordinator) toNextPhase() {
 		c.DistPhase = ReducePhase
 	} else if c.DistPhase == ReducePhase {
 		c.DistPhase = ExitPhase
+	}
+}
+
+// 检测crash
+func (c *Coordinator) CrashDetector() {
+	for {
+		//两秒检测一次
+		time.Sleep(time.Second * 2)
+		lock.Lock()
+		if c.DistPhase == ExitPhase {
+			lock.Unlock()
+			break
+		}
+		//	遍历所有任务状态信息
+		for _, v := range c.TaskMetaHolder.MetaMap {
+			//如果任务已经运行了超过10S后
+			if v.state == Working && time.Since(v.StartTime) > 9*time.Second {
+				switch v.TaskAddr.TaskType {
+				case MapTask:
+					c.TaskChannelMap <- v.TaskAddr
+					v.state = Waiting
+				case ReduceTask:
+					c.TaskChannelReduce <- v.TaskAddr
+					v.state = Waiting
+				}
+			}
+		}
+		lock.Unlock()
 	}
 }

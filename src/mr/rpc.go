@@ -38,7 +38,7 @@ type Task struct {
 	TaskId   int
 	TaskType TaskType
 	NReduce  int
-	FileName string
+	FileName []string
 }
 
 // TaskArgs rpc应该传入的参数，可实际上应该什么都不用传,因为只是worker获取一个任务
