@@ -58,6 +58,13 @@ const (
 	Leader
 )
 
+// Log entry
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command string
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu          sync.Mutex          // Lock to protect shared access to this peer's state
@@ -65,11 +72,16 @@ type Raft struct {
 	persister   *Persister          // Object to hold this peer's persisted state
 	me          int                 // this peer's index into peers[]
 	dead        int32               // set by Kill()
-	currentTerm int
-	votedFor    int
-	role        State
-	timeout     time.Time
-	VoteNum     int
+	currentTerm int                 // 当前任期
+	votedFor    int                 //已经投给了谁
+	role        State               //当前服务的角色，Leader / Follower / Candidater
+	timeout     time.Time           //选举超时的时间点
+	VoteNum     int                 //拿到的选票数量
+	logs        []LogEntry          //日志条目切片
+	commitIndex int                 //提交日志条目索引
+	lastApplied int                 //上一个运行的日志条目索引
+	nextIndex   []int               //对于每个服务器，下一个要发送到该服务器的日志条目的索引
+	matchIndex  []int               //对于每台服务器，已知在服务器上复制的最高日志条目的索引
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -372,10 +384,12 @@ func (rf *Raft) ticker() {
 			} else {
 				//	发起选举
 				//1、更改本身的状态信息
+
 				rf.currentTerm++
 				rf.role = Candidate
 				rf.votedFor = rf.me
 				rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+
 				log.Printf("Follower-%d，达到选举超时点，转成Candidate,发起选举，任期为%d \n", rf.me, rf.currentTerm)
 				//	2、向其他的server发起投票流程
 				voteArgs := &RequestVoteArgs{
