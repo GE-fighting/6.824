@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	//	"bytes"
@@ -80,8 +81,8 @@ type Raft struct {
 	logs        []LogEntry          //日志条目切片
 	commitIndex int                 //提交日志条目索引
 	lastApplied int                 //上一个运行的日志条目索引
-	nextIndex   []int               //对于每个服务器，下一个要发送到该服务器的日志条目的索引
-	matchIndex  []int               //对于每台服务器，已知在服务器上复制的最高日志条目的索引
+	nextIndex   []int               //对于每个服务器，下一个要发送到该服务器的日志条目的索引，选举成功的时候初始化
+	matchIndex  []int               //对于每台服务器，已知在服务器上复制成功的最高日志条目的索引，选举成功的时候初始化
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -172,13 +173,21 @@ type RequestVoteReply struct {
 }
 
 type AppendEntryArg struct {
-	Term int
+	Term         int        // 领导者任期
+	LeaderId     int        // 领导者ID
+	PrevLogIndex int        // 新日志前的索引 和任期一起做一致性检查
+	PrevLogTerm  int        // 新日志前的任期
+	Entries      []LogEntry // 日志条目
 }
 
 type AppendEntryReply struct {
 	Term      int
 	SyncState bool
+	Success   bool // Follower 日志中匹配preLogIndex 和 preLogTerm 返回true; 否则false
 }
+
+//rules : 1、如果AppendEntryArg中Term 小于 follower中的currentTerm，返回false
+//		  2、
 
 // example RequestVote RPC handler.  处理发送过来的处理请求
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -221,6 +230,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
 	// Your code here (2A, 2B).
 }
+
 func (rf *Raft) AppendEntries(args *AppendEntryArg, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -236,6 +246,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArg, reply *AppendEntryReply) {
 		rf.currentTerm = args.Term
 		reply.Term = args.Term
 		reply.SyncState = true
+		//判断参数中的preLogIndex等于本地最后一个日志条目的索引，并判断任期是否相等
 	}
 	rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
 }
@@ -300,6 +311,15 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
 							go rf.sendAppendEntries(i, beatArg)
 						}
 					}
+					//初始化nextIndex[] 和 matchIndex[]
+					for i := 0; i < len(rf.peers); i++ {
+						if i == rf.me {
+							rf.nextIndex = append(rf.nextIndex, 0)
+						} else {
+							rf.nextIndex = append(rf.nextIndex, rf.commitIndex+1)
+						}
+						rf.matchIndex = append(rf.matchIndex, 0)
+					}
 
 				}
 			}
@@ -323,8 +343,45 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 			rf.votedFor = -1
 			rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
 			rf.mu.Unlock()
+			return
 		}
-
+		//对添加日志结果做处理,锁住共享变量
+		//1、判断返回的任期和当前任期是否相等，如果小于当前任期，则忽略;只对一样的任期结果做处理
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if reply.Term == rf.currentTerm {
+			//2、判断当RPC返回后，此时Leader节点的的NextIndex[peer]有没有改变，如果改变了就说明响应过期了
+			if rf.nextIndex[server]-1 == args.PrevLogIndex {
+				//3、在Follower服务上添加日志成功
+				if reply.Success {
+					//更新matchIndex[peer]为已经追加的日志的索引值
+					rf.matchIndex[server] = rf.nextIndex[server]
+					//判断RAFT集群中是否有一半的服务都复制了这个日志
+					replicatedNUm := 1
+					for i := 0; i < len(rf.peers); i++ {
+						if i != rf.me {
+							if rf.matchIndex[i] == rf.nextIndex[i] {
+								replicatedNUm++
+							}
+						}
+					}
+					//当一半的服务器都复制成功之后
+					if replicatedNUm > len(rf.peers) {
+						//确认日志提交
+						rf.commitIndex = args.PrevLogIndex + 1
+					}
+				} else {
+					//日志不匹配，通过递减NextIndex[peer]的去实现
+					rf.nextIndex[server] -= 1
+					//构建log entry
+					preLogIndex := rf.nextIndex[server] - 1
+					preLogTerm := rf.logs[preLogIndex].Term
+					args := &AppendEntryArg{Term: rf.currentTerm, LeaderId: rf.me, PrevLogTerm: preLogTerm,
+						PrevLogIndex: preLogIndex, Entries: rf.logs[rf.nextIndex[server] : rf.nextIndex[server]+1]}
+					go rf.sendAppendEntries(server, args)
+				}
+			}
+		}
 	}
 
 }
@@ -344,8 +401,33 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
+	if rf.role != Leader {
+		return index, term, false
+	}
 	isLeader := true
-
+	//0、拿到准备发送给其他的Follower服务的args
+	preLogIndex := 0
+	preLogTerm := 0
+	if len(rf.logs) != 0 {
+		preLogIndex = rf.logs[len(rf.logs)-1].Index
+		preLogTerm = rf.logs[len(rf.logs)-1].Term
+	}
+	//1、将该命令添加到本地的日志条目中
+	entry := LogEntry{
+		Term:    rf.currentTerm,
+		Index:   rf.commitIndex + 1,
+		Command: fmt.Sprintf("%v", command),
+	}
+	rf.logs = append(rf.logs, entry)
+	//2、并行发送RPC将日志复制到其他服务上
+	args := &AppendEntryArg{Term: rf.currentTerm, PrevLogIndex: preLogIndex,
+		PrevLogTerm: preLogTerm, LeaderId: rf.me, Entries: rf.logs[len(rf.logs)-1:]}
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			//在协程里面处理后续逻辑
+			go rf.sendAppendEntries(i, args)
+		}
+	}
 	// Your code here (2B).
 
 	return index, term, isLeader
@@ -441,6 +523,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.role = Follower
 	rf.timeout = time.Now().Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	// nextIndex[]  和 matchIndex[]
 	log.Printf("创建follower-%d,选举时间-%v\n", me, rf.timeout)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
