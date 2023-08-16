@@ -206,7 +206,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 	//	当前当前服务选举时间
-	rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+	rf.timeout = getElectionTimeout(rf.timeout)
 	// Your code here (2A, 2B).
 }
 func (rf *Raft) AppendEntries(args *AppendEntryArg, reply *AppendEntryReply) {
@@ -360,22 +360,25 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
-func (rf *Raft) ticker() {
+func (rf *Raft) sustainedElection() {
 	// Your code here to check if a leader election should
 	// be started and to randomize sleeping time using
 	// time.Sleep().
 	for rf.killed() == false {
 		//1、当目前节点状态不是Leader时,判断是否选举
 		if rf.role != Leader {
+			log.Printf("\"Follower-%d，进入ticker阶段", rf.me)
 			if time.Now().Before(rf.timeout) {
 				time.Sleep(rf.timeout.Sub(time.Now()))
 			} else {
 				//	发起选举
 				//1、更改本身的状态信息
+				rf.mu.Lock()
 				rf.currentTerm++
 				rf.role = Candidate
 				rf.votedFor = rf.me
-				rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+				rf.timeout = getElectionTimeout(rf.timeout)
+				rf.mu.Unlock()
 				log.Printf("Follower-%d，达到选举超时点，转成Candidate,发起选举，任期为%d \n", rf.me, rf.currentTerm)
 				//	2、向其他的server发起投票流程
 				voteArgs := &RequestVoteArgs{
@@ -387,14 +390,18 @@ func (rf *Raft) ticker() {
 						go rf.sendRequestVote(i, voteArgs)
 					}
 				}
-
 			}
 
-		} else {
-			//	每100ms向其他server发送心跳信息
-			//	发送心跳消息
-			arg := &AppendEntryArg{Term: rf.currentTerm}
+		}
 
+	}
+}
+
+func (rf *Raft) sustainedSendHeartBeat() {
+	for rf.killed() == false {
+		if rf.role == Leader {
+			//	每100ms向其他server发送心跳信息
+			arg := &AppendEntryArg{Term: rf.currentTerm}
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
 					go rf.sendAppendEntries(i, arg)
@@ -402,7 +409,6 @@ func (rf *Raft) ticker() {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-
 	}
 }
 
@@ -426,13 +432,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.role = Follower
-	rf.timeout = time.Now().Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+	rf.timeout = getElectionTimeout(time.Now())
 	log.Printf("创建follower-%d,选举时间-%v\n", me, rf.timeout)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
-
+	go rf.sustainedElection()
+	go rf.sustainedSendHeartBeat()
 	return rf
+}
+
+func getElectionTimeout(original time.Time) time.Time {
+	return original.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
 }
