@@ -316,7 +316,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
 						if i == rf.me {
 							rf.nextIndex = append(rf.nextIndex, 0)
 						} else {
-							rf.nextIndex = append(rf.nextIndex, rf.commitIndex+1)
+							rf.nextIndex = append(rf.nextIndex, len(rf.logs))
 						}
 						rf.matchIndex = append(rf.matchIndex, 0)
 					}
@@ -336,7 +336,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 	} else {
 		if reply.SyncState == false {
 			log.Printf("leader-%d 发送心跳信息到 server-%d 返回false，leader更新为follower\n", rf.me, server)
-			//转化为Follow角色后，要做的更新server操作
+			//转化为Follow角色后，更新服务状态
 			rf.mu.Lock()
 			rf.currentTerm = reply.Term
 			rf.role = Follower
@@ -360,16 +360,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 					replicatedNUm := 1
 					for i := 0; i < len(rf.peers); i++ {
 						if i != rf.me {
-							if rf.matchIndex[i] == rf.nextIndex[i] {
+							if rf.matchIndex[i] >= rf.nextIndex[i] {
 								replicatedNUm++
 							}
 						}
 					}
 					//当一半的服务器都复制成功之后
-					if replicatedNUm > len(rf.peers) {
+					if replicatedNUm > len(rf.peers)/2 {
 						//确认日志提交
 						rf.commitIndex = args.PrevLogIndex + 1
 					}
+					//更新nextIndex[]
+					//返回成功，说明follower服务已经接收了日志，于是需要将nextIndex[]更新
+					rf.nextIndex[server] += 1
 				} else {
 					//日志不匹配，通过递减NextIndex[peer]的去实现
 					rf.nextIndex[server] -= 1
@@ -420,10 +423,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.logs = append(rf.logs, entry)
 	//2、并行发送RPC将日志复制到其他服务上
-	args := &AppendEntryArg{Term: rf.currentTerm, PrevLogIndex: preLogIndex,
-		PrevLogTerm: preLogTerm, LeaderId: rf.me, Entries: rf.logs[len(rf.logs)-1:]}
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
+			nextIndex := rf.nextIndex[i]
+			args := &AppendEntryArg{Term: rf.currentTerm, PrevLogIndex: rf.logs[nextIndex-1].Index,
+				PrevLogTerm: rf.logs[nextIndex-1].Term, LeaderId: rf.me, Entries: rf.logs[nextIndex:]}
 			//在协程里面处理后续逻辑
 			go rf.sendAppendEntries(i, args)
 		}
@@ -466,12 +470,10 @@ func (rf *Raft) ticker() {
 			} else {
 				//	发起选举
 				//1、更改本身的状态信息
-
 				rf.currentTerm++
 				rf.role = Candidate
 				rf.votedFor = rf.me
 				rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
-
 				log.Printf("Follower-%d，达到选举超时点，转成Candidate,发起选举，任期为%d \n", rf.me, rf.currentTerm)
 				//	2、向其他的server发起投票流程
 				voteArgs := &RequestVoteArgs{
@@ -525,7 +527,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.timeout = time.Now().Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	// nextIndex[]  和 matchIndex[]
+	//初始化log
+	logs := make([]LogEntry, 0, 1024)
+	initLogEntry := LogEntry{Term: 0, Index: 0, Command: ""}
+	logs = append(logs, initLogEntry)
+	rf.logs = logs
+	// nextIndex[]  和 matchIndex[]等节点成功当选leader时初始化
 	log.Printf("创建follower-%d,选举时间-%v\n", me, rf.timeout)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
