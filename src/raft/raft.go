@@ -172,9 +172,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
-	Term        int
-	CandidateId int
-
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 	// Your data here (2A, 2B).
 }
 
@@ -184,6 +185,11 @@ type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
 	// Your data here (2A).
+}
+
+type RequestVoteResult struct {
+	peerId int
+	resp   *RequestVoteReply
 }
 
 // 心跳或日志追加的参数
@@ -209,42 +215,39 @@ type AppendEntryReply struct {
 // example RequestVote RPC handler.  处理发送过来的处理请求
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
+	defer log.Printf("node-%d 收到 candidate-%d vote request\n", rf.me, args.CandidateId)
 	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	//	当前当前服务选举时间
+	rf.timeout = getElectionTime(rf.timeout)
 	//候选者任期小于当前server当前任期，拒绝投票
 	if rf.currentTerm > args.Term {
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-
-	} else if rf.currentTerm < args.Term {
-		//候选者任期大于当前server当前任期，投票，这个时候应该是不管有没有投过票，都要投票
-		//未投过票
-		reply.VoteGranted = true
-		reply.Term = args.Term
-		//更新当前server为Follower状态，更新任期和选举时间
-		rf.role = Follower
-		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
-
-	} else {
-		//只有是Follow才会同意投票，其他的只会给自己投吧
-		if rf.role == Follower {
-			//如果没有投过票，则发起投票
-			if rf.votedFor != -1 {
-				reply.VoteGranted = true
-				reply.Term = args.Term
-				//	当前当前服务选举时间
-				rf.votedFor = args.CandidateId
-			} else {
-				reply.VoteGranted = false
-				reply.Term = args.Term
-			}
-		} else {
-			reply.VoteGranted = false
-			reply.Term = args.Term
-		}
+		return
 	}
-	//	当前当前服务选举时间
-	rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+	if rf.currentTerm < args.Term {
+		//更新当前server为Follower状态，更新任期
+		rf.role = Follower
+		rf.currentTerm = args.Term
+		//需要比较一条最新的日志情况再决定要不要投票
+		rf.votedFor = -1
+		rf.leaderId = -1
+		rf.persist()
+	}
+	//避免重复投票,投过一次就不会再投了
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		//拿到自己最新的日志index和term
+		index, term := rf.getLogLastIndex(), rf.logs[rf.getLogLastIndex()].Term
+		//candidate最后一条任期更大 或者任期一样日志更长
+		if args.LastLogTerm > term || (args.LastLogTerm == term && args.LastLogIndex >= index) {
+			rf.role = Follower
+			rf.votedFor = args.CandidateId
+			rf.leaderId = args.CandidateId
+			reply.VoteGranted = true
+			rf.persist()
+		}
+
+	}
 	// Your code here (2A, 2B).
 }
 
@@ -320,44 +323,55 @@ func (rf *Raft) AppendEntries(args *AppendEntryArg, reply *AppendEntryReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
-	if rf.role == Candidate {
-		//从主线程传过来，保证在协程中修改数据，不会影响发送选举的RPC数据
-		reply := &RequestVoteReply{}
-		log.Printf("candidate-%d 调用 server-%d RequestVote \n", rf.me, server)
-		ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-		if ok {
-			rf.mu.Lock()
-			//如果得到选票，更新以获取的选票数量
-			if reply.VoteGranted {
-				log.Printf("candidate-%d 得到server-%d 的选票 \n", rf.me, server)
-				rf.VoteNum++
-				log.Printf("candidate-%d 的选票数为 %d \n", rf.me, rf.VoteNum)
-			} else {
-				//如果，没有得到选票，从返回来的结果，更新自己的任期，并又转化为Follower状态
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.role = Follower
-					rf.votedFor = -1
-					rf.timeout = rf.timeout.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
-				}
-			}
-			//如果目前还是Candidate时
-			if rf.role == Candidate {
-				if rf.VoteNum > len(rf.peers)/2 {
-					log.Printf("candidate-%d 成为Leader ，开始并行发送心跳信息 \n", rf.me)
-					rf.role = Leader
-					beatArg := &AppendEntryArg{Term: rf.currentTerm}
-					for i := 0; i < len(rf.peers); i++ {
-						if i != rf.me {
-							go rf.sendAppendEntries(i, beatArg)
-						}
+func (rf *Raft) sendRequestVote(args *RequestVoteArgs) (int, int) {
+	//定义投票结果chan
+	results := make(chan *RequestVoteResult, len(rf.peers)-1)
+	//向其他服务发送投票消息
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(server int, args *RequestVoteArgs) {
+				reply := &RequestVoteReply{}
+				ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+				if ok {
+					results <- &RequestVoteResult{
+						peerId: server,
+						resp:   reply,
+					}
+				} else {
+					results <- &RequestVoteResult{
+						peerId: server,
+						resp:   nil,
 					}
 				}
-			}
-			rf.mu.Unlock()
+			}(i, args)
+
 		}
 	}
+	//定义当前最大的任期
+	maxTerm := rf.currentTerm
+	voteGranted := 1
+	totalVote := 1
+	//取出chan中的投票结果做判断
+	for i := 0; i < len(rf.peers)-1; i++ {
+		select {
+		case vote := <-results:
+			totalVote++
+			if vote.resp != nil {
+				if vote.resp.VoteGranted {
+					voteGranted++
+				}
+				//如果发现其他服务存在更大的任期，则回退为follower
+				if vote.resp.Term > maxTerm {
+					maxTerm = vote.resp.Term
+				}
+			}
+		}
+		//已经有一半的服务同意 或 所以的节点都收到返回消息后
+		if voteGranted > len(rf.peers)/2 || totalVote == len(rf.peers) {
+			return maxTerm, voteGranted
+		}
+	}
+	return maxTerm, voteGranted
 }
 
 // leader 节点向其他服务发送心跳消息
@@ -504,15 +518,28 @@ func (rf *Raft) ticker() {
 				log.Printf("Follower-%d，达到选举超时点，转成Candidate,发起选举，任期为%d \n", rf.me, rf.currentTerm)
 				//	2、向其他的server发起投票流程
 				voteArgs := &RequestVoteArgs{
-					Term:        rf.currentTerm,
-					CandidateId: rf.me,
+					Term:         rf.currentTerm,
+					CandidateId:  rf.me,
+					LastLogIndex: rf.getLogLastIndex(),
+					LastLogTerm:  rf.logs[rf.getLogLastIndex()].Term,
 				}
-				for i := 0; i < len(rf.peers); i++ {
-					if i != rf.me {
-						go rf.sendRequestVote(i, voteArgs)
-					}
+				maxTerm, agreeNum := rf.sendRequestVote(voteArgs)
+				//如果节点角色不是candidate
+				if rf.role != Candidate {
+					return
 				}
-
+				rf.mu.Lock()
+				if maxTerm > rf.currentTerm {
+					rf.role = Follower
+					rf.currentTerm = maxTerm
+					rf.votedFor = -1
+					rf.leaderId = -1
+					rf.persist()
+				} else if agreeNum > len(rf.peers)/2 {
+					rf.role = Leader
+					rf.leaderId = rf.me
+					log.Printf("node-%d 成功leader\n", rf.me)
+				}
 			}
 
 		}
@@ -523,7 +550,7 @@ func (rf *Raft) ticker() {
 // leader节点 持续发送心跳消息
 func (rf *Raft) loopHeartBeat() {
 	if !rf.killed() {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 		if rf.role == Leader {
 			//	每100ms向其他server发送心跳信息
 			for i := 0; i < len(rf.peers); i++ {
