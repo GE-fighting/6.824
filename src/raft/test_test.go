@@ -65,19 +65,22 @@ func TestReElection2A(t *testing.T) {
 	DPrintf("-----------------让leader-node-%d disconnect,时间是 %v-----------------------\n", leader1, time.Now())
 
 	cfg.disconnect(leader1)
+	DPrintf("------------第二次checkOneLeader----------")
 	cfg.checkOneLeader()
 	DPrintf("-----------------让leader-node-%d disconnect后，通过checkOneLeader测试,时间是 %v\n-----------------------", leader1, time.Now())
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
 	cfg.connect(leader1)
-	DPrintf("older-node-%d 重新连接,时间是%v\n", leader1, time.Now())
+	DPrintf("older-node-%d 重新连接,时间是%v,开始第三次的CheckOneLeader\n", leader1, time.Now())
 	leader2 := cfg.checkOneLeader()
 	DPrintf("-----------------older-leader-node-%d重新连接，应该切换为follower状态；通过checkOneLeader测试，此时Leader是 node-%d,时间是 %v\n-----------------------", leader1, leader2, time.Now())
 	// if there's no quorum, no new leader should
 	// be elected.
 	DPrintf("不存在多数派，时间是%v\n", time.Now())
+	DPrintf("让node-%d disconnected \n", leader2)
 	cfg.disconnect(leader2)
+	DPrintf("让node-%d disconnected \n", leader2+1)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 

@@ -267,16 +267,19 @@ func (rf *Raft) AppendEntries(args *AppendEntryArg, reply *AppendEntryReply) {
 		return
 	}
 	//收到任期更大的心跳信息，转为这个任期的follower，即 Follower,Leader -> follower
-	if args.Term > rf.currentTerm {
-		//更新共享数据，就得加锁
-		rf.role = Follower
-		rf.currentTerm = args.Term
-		rf.persist()
-	}
+	//if args.Term > rf.currentTerm {
+	//	//更新共享数据，就得加锁
+	//	rf.role = Follower
+	//	rf.currentTerm = args.Term
+	//	rf.persist()
+	//}
 	//心跳消息的任期大于等于自己的
 	rf.leaderId = args.LeaderId
 	rf.votedFor = args.LeaderId
+	rf.role = Follower
+	rf.currentTerm = args.Term
 	rf.timeout = getElectionTime(rf.timeout)
+	rf.persist()
 	DPrintf("time-%v,node-%d 收到了leader-%d的心跳消息，选举时间是-%v\n", time.Now(), rf.me, args.LeaderId, rf.timeout)
 	//还缺少前面的日志或者前一条日志匹配不上
 	if args.PrevLogIndex > rf.getLogLastIndex() || rf.logs[rf.getLogLastIndex()].Term != args.PrevLogTerm {
@@ -509,58 +512,59 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		time.Sleep(1 * time.Millisecond)
 		//1、当目前节点状态不是Leader时,判断是否选举
-		if rf.role != Leader {
+		func() {
+			if rf.role == Leader {
+				return
+			}
 			if time.Now().Before(rf.timeout) {
-				//
-				continue
-			} else {
-				//	发起选举
-				//1、更改本身的状态信息
-				rf.mu.Lock()
-				rf.currentTerm++
-				rf.role = Candidate
-				rf.votedFor = rf.me
-				DPrintf("-----------------------------Follower-%d，达到选举超时点%v，转成Candidate,发起选举，任期为%d \n", rf.me, rf.timeout, rf.currentTerm)
-				rf.timeout = getElectionTime(rf.timeout)
-				rf.persist()
-				rf.mu.Unlock()
+				return
+			}
+			//	发起选举
+			//1、更改本身的状态信息
+			rf.mu.Lock()
+			rf.currentTerm++
+			rf.role = Candidate
+			rf.votedFor = rf.me
+			DPrintf("-----------------------------Follower-%d，达到选举超时点%v，转成Candidate,发起选举，任期为%d \n", rf.me, rf.timeout, rf.currentTerm)
+			rf.timeout = getElectionTime(rf.timeout)
+			rf.persist()
+			rf.mu.Unlock()
 
-				//	2、向其他的server发起投票流程
-				voteArgs := &RequestVoteArgs{
-					Term:         rf.currentTerm,
-					CandidateId:  rf.me,
-					LastLogIndex: rf.getLogLastIndex(),
-					LastLogTerm:  rf.logs[rf.getLogLastIndex()].Term,
-				}
-				maxTerm, agreeNum := rf.sendRequestVote(voteArgs)
-				//如果节点角色不是candidate
-				if rf.role != Candidate {
-					return
-				}
-				rf.mu.Lock()
-				if maxTerm > rf.currentTerm {
-					rf.role = Follower
-					rf.currentTerm = maxTerm
-					rf.votedFor = -1
-					rf.leaderId = -1
-					rf.persist()
-				} else if agreeNum > len(rf.peers)/2 {
-					rf.role = Leader
-					rf.leaderId = rf.me
-					DPrintf("node-%d 成功leader\n", rf.me)
-					//马上发一条心跳消息
-					//rf.HeartBeat()
-				}
+			//	2、向其他的server发起投票流程
+			voteArgs := &RequestVoteArgs{
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: rf.getLogLastIndex(),
+				LastLogTerm:  rf.logs[rf.getLogLastIndex()].Term,
+			}
+			maxTerm, agreeNum := rf.sendRequestVote(voteArgs)
+			//如果节点角色不是candidate
+			if rf.role != Candidate {
+				return
+			}
+			rf.mu.Lock()
+			if maxTerm > rf.currentTerm {
+				rf.role = Follower
+				rf.currentTerm = maxTerm
+				rf.votedFor = -1
+				rf.leaderId = -1
+				rf.persist()
+			} else if agreeNum > len(rf.peers)/2 {
+				rf.role = Leader
+				rf.leaderId = rf.me
+				DPrintf("node-%d 成功leader\n", rf.me)
+				//马上发一条心跳消息
+				rf.HeartBeat()
 			}
 
-		}
+		}()
 
 	}
 }
 
 // leader节点 持续发送心跳消息
 func (rf *Raft) loopHeartBeat() {
-	for !rf.killed() {
+	for rf.killed() == false {
 		time.Sleep(100 * time.Millisecond)
 		if rf.role == Leader {
 			DPrintf("node-%d 现在是leader了，发送心跳消息，任期是%d,时间是%v\n", rf.me, rf.currentTerm, time.Now())
@@ -632,6 +636,7 @@ func (rf *Raft) HeartBeat() {
 			//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
 			arg.Entries = append(entries, rf.logs[rf.nextIndex[i]:logLastIndex+1]...)
 		}
+		DPrintf("leader-%d 向 node-%d 发送消息\n", rf.me, i)
 		go rf.sendAppendEntries(i, &arg)
 	}
 }
