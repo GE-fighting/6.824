@@ -214,7 +214,6 @@ type AppendEntryReply struct {
 // example RequestVote RPC handler.  处理发送过来的处理请求
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
-
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -354,7 +353,9 @@ func (rf *Raft) sendRequestVote(args *RequestVoteArgs) (int, int) {
 	}
 	//定义当前最大的任期
 	maxTerm := rf.currentTerm
+	//同意选票数
 	voteGranted := 1
+	//总投票数
 	totalVote := 1
 	//取出chan中的投票结果做判断
 	for i := 0; i < len(rf.peers)-1; i++ {
@@ -506,10 +507,12 @@ func (rf *Raft) ticker() {
 	// be started and to randomize sleeping time using
 	// time.Sleep().
 	for rf.killed() == false {
+		time.Sleep(1 * time.Millisecond)
 		//1、当目前节点状态不是Leader时,判断是否选举
 		if rf.role != Leader {
 			if time.Now().Before(rf.timeout) {
-				time.Sleep(rf.timeout.Sub(time.Now()))
+				//
+				continue
 			} else {
 				//	发起选举
 				//1、更改本身的状态信息
@@ -558,7 +561,7 @@ func (rf *Raft) ticker() {
 // leader节点 持续发送心跳消息
 func (rf *Raft) loopHeartBeat() {
 	for !rf.killed() {
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		if rf.role == Leader {
 			DPrintf("node-%d 现在是leader了，发送心跳消息，任期是%d,时间是%v\n", rf.me, rf.currentTerm, time.Now())
 			rf.HeartBeat()
@@ -705,5 +708,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func getElectionTime(original time.Time) time.Time {
-	return original.Add(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+	return original.Add(time.Duration(200+rand.Intn(100)) * time.Millisecond)
 }

@@ -433,6 +433,7 @@ func (cfg *config) checkOneLeader() int {
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
+				DPrintf("观察node-%d信息，角色是%v,任期是-%d\n", i, cfg.rafts[i].role, cfg.rafts[i].currentTerm)
 				if term, leader := cfg.rafts[i].GetState(); leader {
 					DPrintf("leader-%d,任期是%d\n", i, term)
 					leaders[term] = append(leaders[term], i)
