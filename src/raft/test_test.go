@@ -32,6 +32,7 @@ func TestInitialElection2A(t *testing.T) {
 	// sleep a bit to avoid racing with followers learning of the
 	// election, then check that all peers agree on the term.
 	time.Sleep(50 * time.Millisecond)
+	fmt.Printf("进行第一次任期检查，现在的时间是-%v\n", time.Now())
 	term1 := cfg.checkTerms()
 	if term1 < 1 {
 		t.Fatalf("term is %v, but should be at least 1", term1)
@@ -51,6 +52,7 @@ func TestInitialElection2A(t *testing.T) {
 }
 
 func TestReElection2A(t *testing.T) {
+	//DPrintf("start TestReElection2A，时间是 %v\n", time.Now())
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
@@ -58,25 +60,30 @@ func TestReElection2A(t *testing.T) {
 	cfg.begin("Test (2A): election after network failure")
 
 	leader1 := cfg.checkOneLeader()
-
+	DPrintf("-----------------通过checkOneLeader测试，此时Leader是 node-%d,时间是 %v\n-----------------------", leader1, time.Now())
 	// if the leader disconnects, a new one should be elected.
+	DPrintf("-----------------让leader-node-%d disconnect,时间是 %v\n-----------------------", leader1, time.Now())
+
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
-
+	DPrintf("-----------------让leader-node-%d disconnect后，通过checkOneLeader测试,时间是 %v\n-----------------------", leader1, time.Now())
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
 	cfg.connect(leader1)
+	DPrintf("older-node-%d 重新连接,时间是%v\n", leader1, time.Now())
 	leader2 := cfg.checkOneLeader()
-
+	DPrintf("-----------------older-leader-node-%d重新连接，应该切换为follower状态；通过checkOneLeader测试，此时Leader是 node-%d,时间是 %v\n-----------------------", leader1, leader2, time.Now())
 	// if there's no quorum, no new leader should
 	// be elected.
+	DPrintf("不存在多数派，时间是%v\n", time.Now())
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
 	// check that the one connected server
 	// does not think it is the leader.
+	DPrintf("开始检查没有Leader结点")
 	cfg.checkNoLeader()
 
 	// if a quorum arises, it should elect a leader.

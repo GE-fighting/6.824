@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"log"
 	"math/rand"
 	"sort"
 
@@ -215,12 +214,15 @@ type AppendEntryReply struct {
 // example RequestVote RPC handler.  处理发送过来的处理请求
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
-	defer log.Printf("node-%d 收到 candidate-%d vote request\n", rf.me, args.CandidateId)
+
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	//	当前当前服务选举时间
 	rf.timeout = getElectionTime(rf.timeout)
+	DPrintf("node-%d 收到 candidate-%d vote request，时间是-%v\n", rf.me, args.CandidateId, time.Now())
+	DPrintf("node-%d 更新选举时间为 %v\n", rf.me, rf.timeout)
+
+	//	当前当前服务选举时间
 	//候选者任期小于当前server当前任期，拒绝投票
 	if rf.currentTerm > args.Term {
 		return
@@ -247,7 +249,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.persist()
 		}
 
+	} else {
+		DPrintf("node-%d 跟候选者node-%d任期一样，但是已经投了另一位候选人node-%d，所以这里拒绝选举\n", rf.me, args.CandidateId, rf.votedFor)
 	}
+
 	// Your code here (2A, 2B).
 }
 
@@ -255,7 +260,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntryArg, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.Printf("node-%d 收到 node-%d 心跳信息，心跳类型是-%d\n", rf.me, args.LeaderId, args.HeartBeatType)
 	//初始化数据
 	reply.Success = false
 	reply.Term = rf.currentTerm
@@ -274,6 +278,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArg, reply *AppendEntryReply) {
 	rf.leaderId = args.LeaderId
 	rf.votedFor = args.LeaderId
 	rf.timeout = getElectionTime(rf.timeout)
+	DPrintf("time-%v,node-%d 收到了leader-%d的心跳消息，选举时间是-%v\n", time.Now(), rf.me, args.LeaderId, rf.timeout)
 	//还缺少前面的日志或者前一条日志匹配不上
 	if args.PrevLogIndex > rf.getLogLastIndex() || rf.logs[rf.getLogLastIndex()].Term != args.PrevLogTerm {
 		return
@@ -379,7 +384,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 	reply := &AppendEntryReply{}
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
-		log.Printf("leader server-%d call AppendEntries RPC to server-%d failed\n", rf.me, server)
+		DPrintf("leader server-%d call AppendEntries RPC to server-%d failed\n", rf.me, server)
 	} else {
 		//如果term变了，表示该结点不再是leader，什么也不做;绝了，确实是这样的
 		if rf.currentTerm != args.Term {
@@ -388,7 +393,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 		rf.mu.Lock()
 		rf.mu.Unlock()
 		if reply.Term > rf.currentTerm {
-			log.Printf("leader-%d 发送心跳信息到 server-%d 返回false，leader更新为follower\n", rf.me, server)
+			DPrintf("leader-%d 发送心跳信息到 server-%d 返回false，leader更新为follower\n", rf.me, server)
 			//转化为Follow角色后，更新服务状态，并持久化
 			rf.currentTerm = reply.Term
 			rf.role = Follower
@@ -417,7 +422,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 			newCommitIndex := matchIndexSlice[len(rf.peers)/2]
 			//提交日志
 			if newCommitIndex > rf.commitIndex && args.Term == rf.logs[newCommitIndex].Term {
-				log.Printf("leader node-%d commit logEntry-%d\n", rf.me, newCommitIndex)
+				DPrintf("leader node-%d commit logEntry-%d\n", rf.me, newCommitIndex)
 				rf.commitIndex = newCommitIndex
 			}
 		} else {
@@ -512,10 +517,11 @@ func (rf *Raft) ticker() {
 				rf.currentTerm++
 				rf.role = Candidate
 				rf.votedFor = rf.me
+				DPrintf("-----------------------------Follower-%d，达到选举超时点%v，转成Candidate,发起选举，任期为%d \n", rf.me, rf.timeout, rf.currentTerm)
 				rf.timeout = getElectionTime(rf.timeout)
 				rf.persist()
 				rf.mu.Unlock()
-				log.Printf("Follower-%d，达到选举超时点，转成Candidate,发起选举，任期为%d \n", rf.me, rf.currentTerm)
+
 				//	2、向其他的server发起投票流程
 				voteArgs := &RequestVoteArgs{
 					Term:         rf.currentTerm,
@@ -538,7 +544,9 @@ func (rf *Raft) ticker() {
 				} else if agreeNum > len(rf.peers)/2 {
 					rf.role = Leader
 					rf.leaderId = rf.me
-					log.Printf("node-%d 成功leader\n", rf.me)
+					DPrintf("node-%d 成功leader\n", rf.me)
+					//马上发一条心跳消息
+					//rf.HeartBeat()
 				}
 			}
 
@@ -549,48 +557,84 @@ func (rf *Raft) ticker() {
 
 // leader节点 持续发送心跳消息
 func (rf *Raft) loopHeartBeat() {
-	if !rf.killed() {
-		time.Sleep(10 * time.Millisecond)
+	for !rf.killed() {
+		time.Sleep(20 * time.Millisecond)
 		if rf.role == Leader {
+			DPrintf("node-%d 现在是leader了，发送心跳消息，任期是%d,时间是%v\n", rf.me, rf.currentTerm, time.Now())
+			rf.HeartBeat()
 			//	每100ms向其他server发送心跳信息
-			for i := 0; i < len(rf.peers); i++ {
-				//对自己发送心跳消息
-				if i == rf.me {
-					rf.matchIndex[i] = rf.getLogLastIndex()
-					rf.nextIndex[i] = rf.matchIndex[i] + 1
-					return
-				}
-				//对其他节点发送心跳消息
-				//记录所发送日志的前一行日志
-				preIndex := rf.matchIndex[i]
-				//构造心跳请求参数
-				arg := AppendEntryArg{
-					Term:              rf.currentTerm,
-					LeaderId:          rf.me,
-					PrevLogIndex:      preIndex,
-					PrevLogTerm:       rf.logs[preIndex].Term,
-					HeartBeatType:     HeartBeatLog,
-					LeaderCommitIndex: rf.commitIndex,
-				}
-				//确认Leader所有日志都被同步到了其他节点上
-				//拿到哦最新日志索引
-				logLastIndex := rf.getLogLastIndex()
-				if rf.matchIndex[i] < logLastIndex {
-					//说明还有日志没有同步过去，更改心跳RPC的参数类型
-					arg.HeartBeatType = AppendEntriesLog
-					entries := make([]LogEntry, 0)
-					//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
-					arg.Entries = append(entries, rf.logs[rf.nextIndex[i]:logLastIndex+1]...)
-				}
-				go rf.sendAppendEntries(i, &arg)
-			}
+			//for i := 0; i < len(rf.peers); i++ {
+			//	//对自己发送心跳消息
+			//	if i == rf.me {
+			//		rf.matchIndex[i] = rf.getLogLastIndex()
+			//		rf.nextIndex[i] = rf.matchIndex[i] + 1
+			//		continue
+			//	}
+			//	//对其他节点发送心跳消息
+			//	//记录所发送日志的前一行日志
+			//	preIndex := rf.matchIndex[i]
+			//	//构造心跳请求参数
+			//	arg := AppendEntryArg{
+			//		Term:              rf.currentTerm,
+			//		LeaderId:          rf.me,
+			//		PrevLogIndex:      preIndex,
+			//		PrevLogTerm:       rf.logs[preIndex].Term,
+			//		HeartBeatType:     HeartBeatLog,
+			//		LeaderCommitIndex: rf.commitIndex,
+			//	}
+			//	//确认Leader所有日志都被同步到了其他节点上
+			//	//拿到最新日志索引
+			//	logLastIndex := rf.getLogLastIndex()
+			//	if rf.matchIndex[i] < logLastIndex {
+			//		//说明还有日志没有同步过去，更改心跳RPC的参数类型
+			//		arg.HeartBeatType = AppendEntriesLog
+			//		entries := make([]LogEntry, 0)
+			//		//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
+			//		arg.Entries = append(entries, rf.logs[rf.nextIndex[i]:logLastIndex+1]...)
+			//	}
+			//	go rf.sendAppendEntries(i, &arg)
+			//}
 
 		}
 	}
 }
 
+func (rf *Raft) HeartBeat() {
+	for i := 0; i < len(rf.peers); i++ {
+		//对自己发送心跳消息
+		if i == rf.me {
+			rf.matchIndex[i] = rf.getLogLastIndex()
+			rf.nextIndex[i] = rf.matchIndex[i] + 1
+			continue
+		}
+		//对其他节点发送心跳消息
+		//记录所发送日志的前一行日志
+		preIndex := rf.matchIndex[i]
+		//构造心跳请求参数
+		arg := AppendEntryArg{
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			PrevLogIndex:      preIndex,
+			PrevLogTerm:       rf.logs[preIndex].Term,
+			HeartBeatType:     HeartBeatLog,
+			LeaderCommitIndex: rf.commitIndex,
+		}
+		//确认Leader所有日志都被同步到了其他节点上
+		//拿到最新日志索引
+		logLastIndex := rf.getLogLastIndex()
+		if rf.matchIndex[i] < logLastIndex {
+			//说明还有日志没有同步过去，更改心跳RPC的参数类型
+			arg.HeartBeatType = AppendEntriesLog
+			entries := make([]LogEntry, 0)
+			//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
+			arg.Entries = append(entries, rf.logs[rf.nextIndex[i]:logLastIndex+1]...)
+		}
+		go rf.sendAppendEntries(i, &arg)
+	}
+}
+
 func (rf *Raft) loopApplyLog(applyCh chan ApplyMsg) {
-	if !rf.killed() {
+	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
 		//定义将要发送到applych中的数据
 		applyMsgs := make([]ApplyMsg, 0)
@@ -607,7 +651,7 @@ func (rf *Raft) loopApplyLog(applyCh chan ApplyMsg) {
 		}
 		go func() {
 			for i := 0; i < len(applyMsgs); i++ {
-				log.Printf("node-%d apply log index-%d and upload to application\n", rf.me, rf.lastApplied)
+				DPrintf("node-%d apply log index-%d and upload to application\n", rf.me, rf.lastApplied)
 				applyCh <- applyMsgs[i]
 			}
 		}()
@@ -649,13 +693,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[i] = 1
 	}
 	// nextIndex[]  和 matchIndex[]等节点成功当选leader时初始化
-	log.Printf("创建follower-%d,选举时间-%v\n", me, rf.timeout)
+	DPrintf("创建follower-%d,选举时间-%v\n", me, rf.timeout)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.loopApplyLog(applyCh)
+	go rf.loopHeartBeat()
 	return rf
 }
 
