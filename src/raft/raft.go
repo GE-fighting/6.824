@@ -85,7 +85,7 @@ type Raft struct {
 	role        State               //当前服务的角色，Leader / Follower / Candidater
 	timeout     time.Time           //选举超时的时间点
 	VoteNum     int                 //拿到的选票数量
-	logs        []LogEntry          //日志条目切片
+	logs        []*LogEntry         //日志条目切片
 	commitIndex int                 //提交日志条目索引
 	lastApplied int                 //上一个运行的日志条目索引
 	nextIndex   []int               //对于每个服务器，下一个要发送到该服务器的日志条目的索引，选举成功的时候初始化
@@ -94,7 +94,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	//状态机
+	applyCond *sync.Cond
+	applyChan chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -193,12 +195,12 @@ type RequestVoteResult struct {
 
 // 心跳或日志追加的参数
 type AppendEntryArg struct {
-	Term              int        // 领导者任期
-	LeaderId          int        // 领导者ID
-	PrevLogIndex      int        // 新日志前的索引 和任期一起做一致性检查
-	PrevLogTerm       int        // 新日志前的任期
-	Entries           []LogEntry // 日志条目
-	LeaderCommitIndex int        //领导者已经提交的日志索引
+	Term              int         // 领导者任期
+	LeaderId          int         // 领导者ID
+	PrevLogIndex      int         // 新日志前的索引 和任期一起做一致性检查
+	PrevLogTerm       int         // 新日志前的任期
+	Entries           []*LogEntry // 日志条目
+	LeaderCommitIndex int         //领导者已经提交的日志索引
 	HeartBeatType     HeartBeatLogType
 }
 
@@ -465,7 +467,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	//1、将该命令添加到本地的日志条目中
 	term = rf.currentTerm
 	index = rf.getLogLastIndex()
-	entry := LogEntry{
+	entry := &LogEntry{
 		Term:    term,
 		Index:   index,
 		Command: command,
@@ -514,6 +516,8 @@ func (rf *Raft) ticker() {
 		time.Sleep(1 * time.Millisecond)
 		//1、当目前节点状态不是Leader时,判断是否选举
 		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			if rf.role == Leader {
 				return
 			}
@@ -522,7 +526,6 @@ func (rf *Raft) ticker() {
 			}
 			//	发起选举
 			//1、更改本身的状态信息
-			rf.mu.Lock()
 			rf.currentTerm++
 			rf.role = Candidate
 			rf.votedFor = rf.me
@@ -633,7 +636,7 @@ func (rf *Raft) HeartBeat() {
 		if rf.matchIndex[i] < logLastIndex {
 			//说明还有日志没有同步过去，更改心跳RPC的参数类型
 			arg.HeartBeatType = AppendEntriesLog
-			entries := make([]LogEntry, 0)
+			entries := make([]*LogEntry, 0)
 			//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
 			arg.Entries = append(entries, rf.logs[rf.nextIndex[i]:logLastIndex+1]...)
 		}
@@ -681,21 +684,29 @@ func (rf *Raft) loopApplyLog(applyCh chan ApplyMsg) {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+	rf := &Raft{
+		mu:        sync.Mutex{},
+		peers:     peers,
+		persister: persister,
+		me:        me,
+		dead:      -1,
+
+		leaderId:    -1,
+		currentTerm: 0,
+		votedFor:    -1,
+		role:        Follower,
+		timeout:     getElectionTime(time.Now()),
+
+		commitIndex: 0,
+		lastApplied: 0,
+		applyChan:   applyCh,
+	}
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	rf.role = Follower
-	rf.timeout = getElectionTime(time.Now())
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.applyCond = sync.NewCond(&rf.mu)
+	DPrintf("创建follower-%d,选举时间-%v\n", me, rf.timeout)
 	//初始化log
-	logs := make([]LogEntry, 1)
-	rf.logs = logs
+	rf.logs = make([]*LogEntry, 0)
 	//init index state
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
@@ -703,18 +714,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex[i] = 0
 		rf.nextIndex[i] = 1
 	}
-	// nextIndex[]  和 matchIndex[]等节点成功当选leader时初始化
-	DPrintf("创建follower-%d,选举时间-%v\n", me, rf.timeout)
+	rf.logs = append(rf.logs, &LogEntry{
+		Index: 0,
+		Term:  0,
+	})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.loopApplyLog(applyCh)
 	go rf.loopHeartBeat()
+	go rf.loopApplyLog(applyCh)
 	return rf
 }
 
 func getElectionTime(original time.Time) time.Time {
-	return original.Add(time.Duration(200+rand.Intn(200)) * time.Millisecond)
+	return original.Add(time.Duration(200+rand.Intn(150)) * time.Millisecond)
 }
