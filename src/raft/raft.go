@@ -386,58 +386,59 @@ func (rf *Raft) sendRequestVote(args *RequestVoteArgs) (int, int) {
 // leader 节点向其他服务发送心跳消息
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 	reply := &AppendEntryReply{}
+	DPrintf("进入发送到node-%d 流程\n", server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	DPrintf("node-%d 返回值了\n", server)
 	if !ok {
 		DPrintf("leader server-%d call AppendEntries RPC to server-%d failed\n", rf.me, server)
+		return
+	}
+	//如果term变了，表示该结点不再是leader，什么也不做;绝了，确实是这样的
+	if rf.currentTerm != args.Term {
+		return
+	}
+	rf.mu.Lock()
+	rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		DPrintf("leader-%d 发送心跳信息到 server-%d 返回false，leader更新为follower\n", rf.me, server)
+		//转化为Follow角色后，更新服务状态，并持久化
+		rf.currentTerm = reply.Term
+		rf.role = Follower
+		rf.votedFor = -1
+		rf.leaderId = -1
+		rf.timeout = getElectionTime(rf.timeout)
+		rf.persist()
+		return
+	}
+	if reply.Success {
+		//1、更新nextIndex[]和matchIndex[]
+		rf.nextIndex[server] += len(args.Entries)
+		rf.matchIndex[server] = rf.nextIndex[server] - 1
+		//提交到哪个位置需要根据中位数来判断，中位数表示过半提交的日志位置，
+		//每次想要提交日志向各结点发送的日志并不完全一样，不能光靠是否发送成功来判断哪些日志应该提交
+		//1、初始化已经传到给个服务结点上的日志的matchIndex切片
+		matchIndexSlice := make([]int, len(rf.peers))
+		for server, matchIndex := range rf.matchIndex {
+			matchIndexSlice[server] = matchIndex
+		}
+		//matchIndex 从小到大排序
+		sort.Slice(matchIndexSlice, func(i, j int) bool {
+			return matchIndexSlice[i] < matchIndexSlice[j]
+		})
+		//取matchIndex的中位数来表示提交最终的commitIndex
+		newCommitIndex := matchIndexSlice[len(rf.peers)/2]
+		//提交日志
+		if newCommitIndex > rf.commitIndex && args.Term == rf.logs[newCommitIndex].Term {
+			DPrintf("leader node-%d commit logEntry-%d\n", rf.me, newCommitIndex)
+			rf.commitIndex = newCommitIndex
+		}
 	} else {
-		//如果term变了，表示该结点不再是leader，什么也不做;绝了，确实是这样的
-		if rf.currentTerm != args.Term {
-			return
+		// 返回false目前只有一种可能，就是目标服务Log缺少，所以要回退nextIndex[server]
+		rf.nextIndex[server] -= 1
+		//注意临界条件
+		if rf.nextIndex[server] < 1 {
+			rf.nextIndex[server] = 1
 		}
-		rf.mu.Lock()
-		rf.mu.Unlock()
-		if reply.Term > rf.currentTerm {
-			DPrintf("leader-%d 发送心跳信息到 server-%d 返回false，leader更新为follower\n", rf.me, server)
-			//转化为Follow角色后，更新服务状态，并持久化
-			rf.currentTerm = reply.Term
-			rf.role = Follower
-			rf.votedFor = -1
-			rf.leaderId = -1
-			rf.timeout = getElectionTime(rf.timeout)
-			rf.persist()
-			return
-		}
-		if reply.Success {
-			//1、更新nextIndex[]和matchIndex[]
-			rf.nextIndex[server] += len(args.Entries)
-			rf.matchIndex[server] = rf.nextIndex[server] - 1
-			//提交到哪个位置需要根据中位数来判断，中位数表示过半提交的日志位置，
-			//每次想要提交日志向各结点发送的日志并不完全一样，不能光靠是否发送成功来判断哪些日志应该提交
-			//1、初始化已经传到给个服务结点上的日志的matchIndex切片
-			matchIndexSlice := make([]int, len(rf.peers))
-			for server, matchIndex := range rf.matchIndex {
-				matchIndexSlice[server] = matchIndex
-			}
-			//matchIndex 从小到大排序
-			sort.Slice(matchIndexSlice, func(i, j int) bool {
-				return matchIndexSlice[i] < matchIndexSlice[j]
-			})
-			//取matchIndex的中位数来表示提交最终的commitIndex
-			newCommitIndex := matchIndexSlice[len(rf.peers)/2]
-			//提交日志
-			if newCommitIndex > rf.commitIndex && args.Term == rf.logs[newCommitIndex].Term {
-				DPrintf("leader node-%d commit logEntry-%d\n", rf.me, newCommitIndex)
-				rf.commitIndex = newCommitIndex
-			}
-		} else {
-			// 返回false目前只有一种可能，就是目标服务Log缺少，所以要回退nextIndex[server]
-			rf.nextIndex[server] -= 1
-			//注意临界条件
-			if rf.nextIndex[server] < 1 {
-				rf.nextIndex[server] = 1
-			}
-		}
-
 	}
 
 }
@@ -565,7 +566,7 @@ func (rf *Raft) ticker() {
 // leader节点 持续发送心跳消息
 func (rf *Raft) loopHeartBeat() {
 	for rf.killed() == false {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 		if rf.role == Leader {
 			DPrintf("node-%d 现在是leader了，发送心跳消息，任期是%d,时间是%v\n", rf.me, rf.currentTerm, time.Now())
 			rf.HeartBeat()
@@ -642,21 +643,23 @@ func (rf *Raft) HeartBeat() {
 }
 
 func (rf *Raft) loopApplyLog(applyCh chan ApplyMsg) {
-	for !rf.killed() {
+	for rf.killed() == false {
 		time.Sleep(10 * time.Millisecond)
 		//定义将要发送到applych中的数据
 		applyMsgs := make([]ApplyMsg, 0)
 		if rf.lastApplied >= rf.commitIndex {
 			return
 		}
+		rf.mu.Lock()
+		//如果最新的被应用到状态机上的日志索引小于已提交的日志索引
 		for rf.lastApplied < rf.commitIndex {
-			rf.mu.Lock()
 			rf.lastApplied++
 			applyMsgs = append(applyMsgs, ApplyMsg{
 				Command:      rf.logs[rf.lastApplied].Command,
 				CommandIndex: rf.lastApplied,
 				CommandValid: true})
 		}
+		rf.mu.Unlock()
 		go func() {
 			for i := 0; i < len(applyMsgs); i++ {
 				DPrintf("node-%d apply log index-%d and upload to application\n", rf.me, rf.lastApplied)
@@ -713,5 +716,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func getElectionTime(original time.Time) time.Time {
-	return original.Add(time.Duration(200+rand.Intn(100)) * time.Millisecond)
+	return original.Add(time.Duration(200+rand.Intn(200)) * time.Millisecond)
 }

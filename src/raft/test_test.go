@@ -58,7 +58,7 @@ func TestReElection2A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2A): election after network failure")
-
+	DPrintf("第一次CheckOneLeader")
 	leader1 := cfg.checkOneLeader()
 	DPrintf("-----------------通过checkOneLeader测试，此时Leader是 node-%d,时间是 %v\n-----------------------", leader1, time.Now())
 	// if the leader disconnects, a new one should be elected.
