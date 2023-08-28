@@ -388,9 +388,7 @@ func (rf *Raft) sendRequestVote(args *RequestVoteArgs) (int, int) {
 // leader 节点向其他服务发送心跳消息
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArg) {
 	reply := &AppendEntryReply{}
-	DPrintf("进入发送到node-%d 流程\n", server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	DPrintf("node-%d 返回值了\n", server)
 	if !ok {
 		DPrintf("leader server-%d call AppendEntries RPC to server-%d failed\n", rf.me, server)
 		return
@@ -543,10 +541,10 @@ func (rf *Raft) ticker() {
 			}
 			maxTerm, agreeNum := rf.sendRequestVote(voteArgs)
 			//如果节点角色不是candidate
+			rf.mu.Lock()
 			if rf.role != Candidate {
 				return
 			}
-			rf.mu.Lock()
 			if maxTerm > rf.currentTerm {
 				rf.role = Follower
 				rf.currentTerm = maxTerm
@@ -640,7 +638,6 @@ func (rf *Raft) HeartBeat() {
 			//因为此时没有加锁，担心有新日志写入，必须保证每个节点复制的最后一条日志一样才能起到过半提交的效果
 			arg.Entries = append(entries, rf.logs[rf.nextIndex[i]:logLastIndex+1]...)
 		}
-		DPrintf("leader-%d 向 node-%d 发送消息\n", rf.me, i)
 		go rf.sendAppendEntries(i, &arg)
 	}
 }
@@ -729,5 +726,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func getElectionTime(original time.Time) time.Time {
-	return original.Add(time.Duration(200+rand.Intn(150)) * time.Millisecond)
+	return original.Add(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 }

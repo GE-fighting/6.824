@@ -74,13 +74,13 @@ func TestReElection2A(t *testing.T) {
 	cfg.connect(leader1)
 	DPrintf("older-node-%d 重新连接,时间是%v,开始第三次的CheckOneLeader\n", leader1, time.Now())
 	leader2 := cfg.checkOneLeader()
-	DPrintf("-----------------older-leader-node-%d重新连接，应该切换为follower状态；通过checkOneLeader测试，此时Leader是 node-%d,时间是 %v\n-----------------------", leader1, leader2, time.Now())
+	DPrintf("-----------------older-leader-node-%d重新连接；通过checkOneLeader测试，此时Leader是 node-%d,时间是 %v\n-----------------------", leader1, leader2, time.Now())
 	// if there's no quorum, no new leader should
 	// be elected.
-	DPrintf("不存在多数派，时间是%v\n", time.Now())
+	DPrintf("--------不存在多数派检测----------------\n")
 	DPrintf("让node-%d disconnected \n", leader2)
 	cfg.disconnect(leader2)
-	DPrintf("让node-%d disconnected \n", leader2+1)
+	DPrintf("让node-%d disconnected \n", (leader2+1)%servers)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
@@ -88,11 +88,13 @@ func TestReElection2A(t *testing.T) {
 	// does not think it is the leader.
 	DPrintf("开始检查没有Leader结点")
 	cfg.checkNoLeader()
-
+	DPrintf("----------------checkNoLeader success-------------------")
 	// if a quorum arises, it should elect a leader.
+	DPrintf("让node-%d connect \n", (leader2+1)%servers)
 	cfg.connect((leader2 + 1) % servers)
+	DPrintf("---------------第四次checkOneLeader开始--------------")
 	cfg.checkOneLeader()
-
+	DPrintf("------------第四次checkOneLeader开始success---------------")
 	// re-join of last node shouldn't prevent leader from existing.
 	cfg.connect(leader2)
 	cfg.checkOneLeader()
